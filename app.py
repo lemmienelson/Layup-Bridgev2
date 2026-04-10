@@ -8,8 +8,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ===== CREDENTIALS =====
-LB_USERNAME  = os.environ.get("LB_USERNAME", "lemmienelson@gmail.com")
-LB_PASSWORD  = os.environ.get("LB_PASSWORD", "Carrie55@")
+LB_USERNAME  = "lemmienelson@gmail.com"
+LB_PASSWORD  = "Carrie55@"
 LB_DOMAIN    = "default"
 LB_ACCOUNT   = "default:2833714_4"
 LB_SYMBOL    = "US30"
