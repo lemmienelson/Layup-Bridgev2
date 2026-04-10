@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO)
 
 LB_USERNAME  = "lemmienelson@gmail.com"
 LB_PASSWORD  = "Carrie55"
-LB_DOMAIN    = "ECN"
+LB_DOMAIN    = "default"
 LB_ACCOUNT   = "ECN:2833714_4"
 LB_SYMBOL    = "US30"
 LB_BASE_URL  = "https://api.liquidcharts.com/dxsca-web"
