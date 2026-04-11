@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import requests
 from datetime import datetime, date
@@ -14,13 +15,13 @@ LB_PASSWORD = "Carrie55@"
 LB_DOMAIN   = "default"
 
 ACCOUNTS = [
-    {"code": "DEM:2833714_6", "start_bal": 500,  "start_date": "2026-04-10", "label": "demo_500"},
-    {"code": "DEM:2833714_5", "start_bal": 1000, "start_date": "2026-04-10", "label": "demo_1000"},
-    {"code": "DEM:2833714_2", "start_bal": 2000, "start_date": "2026-04-10", "label": "demo_2000"},
-    {"code": "DEM:2833714_3", "start_bal": 5000, "start_date": "2026-04-10", "label": "demo_5000"},
-    {"code": "DEM:2833714_1", "start_bal": 9050, "start_date": "2026-04-10", "label": "demo_9050"},
+    {"code": "default:DEM_2833714_6", "start_bal": 500,  "start_date": "2026-04-10", "label": "demo_500"},
+    {"code": "default:DEM_2833714_5", "start_bal": 1000, "start_date": "2026-04-10", "label": "demo_1000"},
+    {"code": "default:DEM_2833714_2", "start_bal": 2000, "start_date": "2026-04-10", "label": "demo_2000"},
+    {"code": "default:DEM_2833714_3", "start_bal": 5000, "start_date": "2026-04-10", "label": "demo_5000"},
+    {"code": "default:DEM_2833714_1", "start_bal": 9050, "start_date": "2026-04-10", "label": "demo_9050"},
     # Uncomment when ready to go live:
-    # {"code": "ECN:2833714_4", "start_bal": 882, "start_date": "2026-03-30", "label": "live"},
+    # {"code": "default:ECN_2833714_4", "start_bal": 882, "start_date": "2026-03-30", "label": "live"},
 ]
 
 DAILY_COMPOUND_RATE = 1.08
@@ -86,21 +87,26 @@ def place_order(account, side, symbol, qty, price):
     if not token:
         return {"error": "no session"}
 
-    order_side = "Buy" if side.lower() == "long" else "Sell"
+    order_side = "BUY" if side.lower() == "long" else "SELL"
+    order_code = "lemmie" + str(int(time.time())) + account["label"]
+
     payload = {
-        "account":   account_code,
-        "symbol":    symbol,
-        "side":      order_side,
-        "orderType": "Market",
-        "quantity":  qty,
-        "price":     price,
+        "orderCode":      order_code,
+        "type":           "MARKET",
+        "side":           order_side,
+        "quantity":       qty,
+        "instrument":     symbol,
+        "positionEffect": "OPEN",
+        "tif":            "GTC",
     }
+
+    encoded = requests.utils.quote(account_code, safe="")
 
     try:
         resp = requests.post(
-            LB_API + "/placeOrder",
+            LB_API + "/accounts/" + encoded + "/orders",
             json=payload,
-            headers={"Authorization": "Bearer " + token},
+            headers={"Authorization": "DXAPI " + token},
             timeout=10,
         )
         data = resp.json()
@@ -110,9 +116,9 @@ def place_order(account, side, symbol, qty, price):
             token = login(account_code)
             if token:
                 resp = requests.post(
-                    LB_API + "/placeOrder",
+                    LB_API + "/accounts/" + encoded + "/orders",
                     json=payload,
-                    headers={"Authorization": "Bearer " + token},
+                    headers={"Authorization": "DXAPI " + token},
                     timeout=10,
                 )
                 data = resp.json()
@@ -129,11 +135,25 @@ def close_position(account, symbol):
     token = get_session(account_code)
     if not token:
         return {"error": "no session"}
+
+    order_code = "close" + str(int(time.time())) + account["label"]
+    encoded = requests.utils.quote(account_code, safe="")
+
+    payload = {
+        "orderCode":      order_code,
+        "type":           "MARKET",
+        "side":           "SELL",
+        "quantity":       calculate_lot_size(account),
+        "instrument":     symbol,
+        "positionEffect": "CLOSE",
+        "tif":            "GTC",
+    }
+
     try:
         resp = requests.post(
-            LB_API + "/closePosition",
-            json={"account": account_code, "symbol": symbol},
-            headers={"Authorization": "Bearer " + token},
+            LB_API + "/accounts/" + encoded + "/orders",
+            json=payload,
+            headers={"Authorization": "DXAPI " + token},
             timeout=10,
         )
         data = resp.json()
