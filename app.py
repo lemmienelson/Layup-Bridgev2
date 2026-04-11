@@ -81,27 +81,8 @@ def login(account_code):
 def get_session(account_code):
     return sessions.get(account_code) or login(account_code)
 
-def place_order(account, side, symbol, qty, price):
-    account_code = account["code"]
-    token = get_session(account_code)
-    if not token:
-        return {"error": "no session"}
-
-    order_side = "BUY" if side.lower() == "long" else "SELL"
-    order_code = "lemmie" + str(int(time.time())) + account["label"]
-
-    payload = {
-        "orderCode":      order_code,
-        "type":           "MARKET",
-        "side":           order_side,
-        "quantity":       qty,
-        "instrument":     symbol,
-        "positionEffect": "OPEN",
-        "tif":            "GTC",
-    }
-
+def send_order(account_code, token, payload):
     encoded = requests.utils.quote(account_code, safe="")
-
     try:
         resp = requests.post(
             LB_API + "/accounts/" + encoded + "/orders",
@@ -110,9 +91,7 @@ def place_order(account, side, symbol, qty, price):
             timeout=10,
         )
         data = resp.json()
-
         if resp.status_code == 401 or "session" in str(data).lower():
-            logger.info(account_code + " session expired, re-logging in")
             token = login(account_code)
             if token:
                 resp = requests.post(
@@ -122,66 +101,131 @@ def place_order(account, side, symbol, qty, price):
                     timeout=10,
                 )
                 data = resp.json()
-
-        logger.info(account_code + " order result: " + str(data))
         return data
-
     except Exception as e:
-        logger.error(account_code + " order error: " + str(e))
         return {"error": str(e)}
 
-def close_position(account, symbol):
+def place_order(account, side, symbol, qty, tp_price, sl_price):
     account_code = account["code"]
     token = get_session(account_code)
     if not token:
         return {"error": "no session"}
 
-    order_code = "close" + str(int(time.time())) + account["label"]
+    order_side  = "BUY"  if side.lower() == "long" else "SELL"
+    close_side  = "SELL" if side.lower() == "long" else "BUY"
+    ts          = str(int(time.time()))
+    label       = account["label"]
+
+    # 1 — Market entry order
+    entry_payload = {
+        "orderCode":      "entry" + ts + label,
+        "type":           "MARKET",
+        "side":           order_side,
+        "quantity":       qty,
+        "instrument":     symbol,
+        "positionEffect": "OPEN",
+        "tif":            "GTC",
+    }
+    entry_result = send_order(account_code, token, entry_payload)
+    logger.info(account_code + " entry: " + str(entry_result))
+
+    results = {"entry": entry_result}
+
+    # Only place TP/SL if entry succeeded
+    if "orderId" in entry_result:
+
+        # 2 — Take Profit (limit order)
+        tp_payload = {
+            "orderCode":      "tp" + ts + label,
+            "type":           "LIMIT",
+            "side":           close_side,
+            "quantity":       qty,
+            "instrument":     symbol,
+            "positionEffect": "CLOSE",
+            "tif":            "GTC",
+            "price":          tp_price,
+        }
+        tp_result = send_order(account_code, token, tp_payload)
+        logger.info(account_code + " TP: " + str(tp_result))
+        results["tp"] = tp_result
+
+        # 3 — Stop Loss (stop order)
+        sl_payload = {
+            "orderCode":      "sl" + ts + label,
+            "type":           "STOP",
+            "side":           close_side,
+            "quantity":       qty,
+            "instrument":     symbol,
+            "positionEffect": "CLOSE",
+            "tif":            "GTC",
+            "stopPrice":      sl_price,
+        }
+        sl_result = send_order(account_code, token, sl_payload)
+        logger.info(account_code + " SL: " + str(sl_result))
+        results["sl"] = sl_result
+
+    return results
+
+def close_all(account, symbol):
+    account_code = account["code"]
+    token = get_session(account_code)
+    if not token:
+        return {"error": "no session"}
+
     encoded = requests.utils.quote(account_code, safe="")
 
-    payload = {
-        "orderCode":      order_code,
+    # Cancel all open orders first
+    try:
+        requests.delete(
+            LB_API + "/accounts/" + encoded + "/orders",
+            headers={"Authorization": "DXAPI " + token},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.error(account_code + " cancel orders error: " + str(e))
+
+    # Then close position with market order
+    ts    = str(int(time.time()))
+    label = account["label"]
+    qty   = calculate_lot_size(account)
+
+    close_payload = {
+        "orderCode":      "close" + ts + label,
         "type":           "MARKET",
         "side":           "SELL",
-        "quantity":       calculate_lot_size(account),
+        "quantity":       qty,
         "instrument":     symbol,
         "positionEffect": "CLOSE",
         "tif":            "GTC",
     }
-
-    try:
-        resp = requests.post(
-            LB_API + "/accounts/" + encoded + "/orders",
-            json=payload,
-            headers={"Authorization": "DXAPI " + token},
-            timeout=10,
-        )
-        data = resp.json()
-        logger.info(account_code + " close result: " + str(data))
-        return data
-    except Exception as e:
-        logger.error(account_code + " close error: " + str(e))
-        return {"error": str(e)}
+    result = send_order(account_code, token, close_payload)
+    logger.info(account_code + " close: " + str(result))
+    return result
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data   = request.get_json(force=True)
-    event  = data.get("event", "").lower()
-    side   = data.get("side", "long")
-    symbol = data.get("symbol", "US30")
-    price  = float(data.get("price", 0))
+    logger.info("Webhook: " + str(data))
+
+    event    = data.get("event", "").lower()
+    side     = data.get("side", "long")
+    symbol   = data.get("symbol", "US30")
+    tp_price = float(data.get("tp", 0))
+    sl_price = float(data.get("sl", 0))
 
     results = {}
 
     if event == "entry":
+        if tp_price == 0 or sl_price == 0:
+            return jsonify({"error": "tp and sl prices required for entry"}), 400
         for account in ACCOUNTS:
             qty    = calculate_lot_size(account)
-            result = place_order(account, side, symbol, qty, price)
+            result = place_order(account, side, symbol, qty, tp_price, sl_price)
             results[account["label"]] = {"lot_size": qty, "result": result}
 
     elif event in ("exit", "tp", "sl", "reset"):
         for account in ACCOUNTS:
-            result = close_position(account, symbol)
+            result = close_all(account, symbol)
             results[account["label"]] = result
 
     else:
