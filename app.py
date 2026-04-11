@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # CREDENTIALS
 # ─────────────────────────────────────────────
 LB_API      = "https://api.liquidcharts.com/dxsca-web"
-LB_USER     = "2833714"
+LB_USER     = "lemmienelson@gmail.com"
 LB_PASSWORD = "Carrie55@"
 LB_DOMAIN   = "default"
 
