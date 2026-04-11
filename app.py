@@ -132,4 +132,4 @@ def place_order(account: dict, side: str, symbol: str, qty: float, price: float)
                     timeout=10,
                 )
                 data = resp.json()
-        logger.​​​​​​​​​​​​​​​​
+                logger.info(f"[{account_code}] session expired, re-logging
