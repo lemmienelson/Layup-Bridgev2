@@ -1,155 +1,240 @@
-from flask import Flask, request, jsonify
-import requests
-import uuid
-import logging
 import os
+import json
+import math
+import logging
+import requests
+from datetime import datetime, date
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ===== CREDENTIALS =====
-LB_USERNAME  = "lemmienelson@gmail.com"
-LB_PASSWORD  = "Carrie55@"
-LB_DOMAIN    = "default"
-LB_ACCOUNT   = "default:2833714_4"
-LB_SYMBOL    = "US30"
-LB_BASE_URL  = "https://api.liquidcharts.com/dxsca-web"
-DEFAULT_QTY  = 0.01
+# ─────────────────────────────────────────────
+# CREDENTIALS
+# ─────────────────────────────────────────────
+LB_API      = "https://api.liquidcharts.com/dxsca-web"
+LB_USER     = "2833714"
+LB_PASSWORD = "Carrie55@"
+LB_DOMAIN   = "default"
 
-session_token = None
+# ─────────────────────────────────────────────
+# ACCOUNTS
+# Each account has:
+#   code        → sent to Liquid Brokers API
+#   start_bal   → the balance this account started at
+#   start_date  → the date trading began (YYYY-MM-DD)
+#   label       → friendly name for logs
+# ─────────────────────────────────────────────
+ACCOUNTS = [
+    {"code": "DEM:2833714_6", "start_bal": 500,   "start_date": "2026-04-10", "label": "demo_500"},
+    {"code": "DEM:2833714_5", "start_bal": 1000,  "start_date": "2026-04-10", "label": "demo_1000"},
+    {"code": "DEM:2833714_2", "start_bal": 2000,  "start_date": "2026-04-10", "label": "demo_2000"},
+    {"code": "DEM:2833714_3", "start_bal": 5000,  "start_date": "2026-04-10", "label": "demo_5000"},
+    {"code": "DEM:2833714_1", "start_bal": 9050,  "start_date": "2026-04-10", "label": "demo_9050"},
+    # Uncomment when ready to go live:
+    # {"code": "ECN:2833714_4", "start_bal": 882, "start_date": "2026-03-30", "label": "live"},
+]
 
-def login():
-    global session_token
-    url  = f"{LB_BASE_URL}/login"
-    body = {
-        "username": LB_USERNAME,
-        "domain":   LB_DOMAIN,
-        "password": LB_PASSWORD
+# ─────────────────────────────────────────────
+# COMPOUNDING SCHEDULE
+# Multiplier is calculated from starting balance.
+# Formula mirrors your spreadsheet:
+#   Day 1 multiplier  = round(start_bal * 0.00008, 2)  (~0.08% of balance)
+#   Each day compounds ~8% on the multiplier
+# Safety cap = 80% of full multiplier (matches your spreadsheet)
+# ─────────────────────────────────────────────
+
+DAILY_COMPOUND_RATE = 1.08   # 8% multiplier growth per winning day
+SAFETY_CAP          = 0.80   # 80% safety cap (matches your spreadsheet)
+BASE_RATE           = 0.00008  # starting multiplier per dollar of balance
+
+def get_trading_day_number(start_date_str: str) -> int:
+    """Returns how many weekdays have passed since start_date (1-indexed)."""
+    start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    today = date.today()
+    if today < start:
+        return 1
+    day_num = 0
+    current = start
+    while current <= today:
+        if current.weekday() < 5:  # Mon–Fri only
+            day_num += 1
+        current = current.fromordinal(current.toordinal() + 1)
+    return max(1, day_num)
+
+def calculate_lot_size(account: dict) -> float:
+    """
+    Calculate today's lot size for an account based on its schedule.
+    Mirrors the Millionaire Weekday Multiplier spreadsheet logic.
+    """
+    start_bal  = account["start_bal"]
+    start_date = account["start_date"]
+
+    # Day 1 base multiplier
+    base_mult = round(start_bal * BASE_RATE, 2)
+    base_mult = max(base_mult, 0.01)  # never below 0.01
+
+    # Compound for each trading day elapsed
+    day_num   = get_trading_day_number(start_date)
+    full_mult = round(base_mult * (DAILY_COMPOUND_RATE ** (day_num - 1)), 2)
+
+    # Apply safety cap
+    safe_mult = round(full_mult * SAFETY_CAP, 2)
+    safe_mult = max(safe_mult, 0.01)
+
+    logger.info(f"[{account['label']}] Day {day_num} | Full mult: {full_mult} | Safe mult: {safe_mult}")
+    return safe_mult
+
+# ─────────────────────────────────────────────
+# SESSION MANAGEMENT
+# ─────────────────────────────────────────────
+sessions = {}  # account_code → session_token
+
+def login(account_code: str) -> str | None:
+    """Login to Liquid Brokers and return session token."""
+    try:
+        resp = requests.post(
+            f"{LB_API}/login",
+            json={
+                "login":    LB_USER,
+                "password": LB_PASSWORD,
+                "domain":   LB_DOMAIN,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        token = data.get("sessionToken") or data.get("token")
+        if token:
+            sessions[account_code] = token
+            logger.info(f"[{account_code}] Login OK")
+            return token
+        logger.error(f"[{account_code}] Login failed: {data}")
+        return None
+    except Exception as e:
+        logger.error(f"[{account_code}] Login error: {e}")
+        return None
+
+def get_session(account_code: str) -> str | None:
+    """Return existing session or re-login."""
+    return sessions.get(account_code) or login(account_code)
+
+# ─────────────────────────────────────────────
+# ORDER PLACEMENT
+# ─────────────────────────────────────────────
+def place_order(account: dict, side: str, symbol: str, qty: float, price: float) -> dict:
+    """Place a market order on Liquid Brokers for one account."""
+    account_code = account["code"]
+    token = get_session(account_code)
+    if not token:
+        return {"error": "no session"}
+
+    order_side = "Buy" if side.lower() == "long" else "Sell"
+    payload = {
+        "account":    account_code,
+        "symbol":     symbol,
+        "side":       order_side,
+        "orderType":  "Market",
+        "quantity":   qty,
+        "price":      price,
     }
-    resp = requests.post(url, json=body)
-    if resp.status_code == 200:
-        session_token = resp.json().get("sessionToken")
-        logging.info("✅ Logged in to Liquid Charts")
-        return True
-    else:
-        logging.error(f"❌ Login failed: {resp.status_code} {resp.text}")
-        return False
 
-def get_headers():
-    return {
-        "Authorization": f"DXAPI {session_token}",
-        "Content-Type":  "application/json"
-    }
+    try:
+        resp = requests.post(
+            f"{LB_API}/placeOrder",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        data = resp.json()
 
-def place_order(side, qty):
-    global session_token
-    if not session_token:
-        if not login():
-            return False, "Login failed"
+        # Auto re-login on session expiry
+        if resp.status_code == 401 or "session" in str(data).lower():
+            logger.info(f"[{account_code}] Session expired, re-logging in")
+            token = login(account_code)
+            if token:
+                resp = requests.post(
+                    f"{LB_API}/placeOrder",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                data = resp.json()
 
-    account_encoded = LB_ACCOUNT.replace(":", "%3A")
-    url = f"{LB_BASE_URL}/accounts/{account_encoded}/orders"
-    client_order_id = f"layup_{uuid.uuid4().hex[:16]}"
+        logger.info(f"[{account_code}] Order result: {data}")
+        return data
 
-    body = {
-        "clientOrderId":  client_order_id,
-        "type":           "MARKET",
-        "instrument":     LB_SYMBOL,
-        "side":           side,
-        "quantity":       str(qty),
-        "positionEffect": "OPEN"
-    }
+    except Exception as e:
+        logger.error(f"[{account_code}] Order error: {e}")
+        return {"error": str(e)}
 
-    resp = requests.post(url, json=body, headers=get_headers())
+def close_position(account: dict, symbol: str) -> dict:
+    """Close open position for one account."""
+    account_code = account["code"]
+    token = get_session(account_code)
+    if not token:
+        return {"error": "no session"}
 
-    if resp.status_code == 401:
-        logging.warning("⚠️ Token expired, re-logging in...")
-        session_token = None
-        if login():
-            resp = requests.post(url, json=body, headers=get_headers())
+    try:
+        resp = requests.post(
+            f"{LB_API}/closePosition",
+            json={"account": account_code, "symbol": symbol},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        data = resp.json()
+        logger.info(f"[{account_code}] Close result: {data}")
+        return data
+    except Exception as e:
+        logger.error(f"[{account_code}] Close error: {e}")
+        return {"error": str(e)}
 
-    if resp.status_code in (200, 201):
-        logging.info(f"✅ Order placed: {side} {qty} {LB_SYMBOL}")
-        return True, resp.json()
-    else:
-        logging.error(f"❌ Order failed: {resp.status_code} {resp.text}")
-        return False, resp.text
-
-def close_position():
-    global session_token
-    if not session_token:
-        if not login():
-            return False, "Login failed"
-
-    account_encoded = LB_ACCOUNT.replace(":", "%3A")
-    url  = f"{LB_BASE_URL}/accounts/{account_encoded}/positions"
-    resp = requests.get(url, headers=get_headers())
-
-    if resp.status_code == 401:
-        session_token = None
-        if login():
-            resp = requests.get(url, headers=get_headers())
-
-    if resp.status_code != 200:
-        logging.error(f"❌ Could not fetch positions: {resp.text}")
-        return False, resp.text
-
-    positions = resp.json()
-    logging.info(f"📊 Positions: {positions}")
-
-    pos_list = positions if isinstance(positions, list) else positions.get("positions", [])
-
-    for pos in pos_list:
-        symbol = pos.get("instrument", pos.get("symbol", ""))
-        if symbol == LB_SYMBOL:
-            qty  = abs(float(pos.get("quantity", 0)))
-            side = pos.get("side", "")
-
-            if qty == 0:
-                logging.info("ℹ️ No open position to close")
-                return True, "flat"
-
-            close_side = "SELL" if side == "BUY" else "BUY"
-            logging.info(f"🔄 Closing {side} {qty} with {close_side}")
-            return place_order(close_side, qty)
-
-    logging.info("ℹ️ No US30 position found")
-    return True, "no position"
-
+# ─────────────────────────────────────────────
+# WEBHOOK ENDPOINT
+# ─────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
+    data = request.get_json(force=True)
+    logger.info(f"Webhook received: {data}")
 
-    logging.info(f"📨 Webhook received: {data}")
+    event  = data.get("event", "").lower()
+    side   = data.get("side", "long")
+    symbol = data.get("symbol", "US30")
+    price  = float(data.get("price", 0))
 
-    event = data.get("event", "")
-    side  = data.get("side", "")
-    qty   = float(data.get("qty", DEFAULT_QTY)) or DEFAULT_QTY
+    results = {}
 
     if event == "entry":
-        if side == "long":
-            ok, result = place_order("BUY", qty)
-        elif side == "short":
-            ok, result = place_order("SELL", qty)
-        else:
-            return jsonify({"error": f"Unknown side: {side}"}), 400
-        return jsonify({"status": "ok" if ok else "error", "result": str(result)}), 200 if ok else 500
+        for account in ACCOUNTS:
+            qty = calculate_lot_size(account)
+            result = place_order(account, side, symbol, qty, price)
+            results[account["label"]] = {"lot_size": qty, "result": result}
 
-    elif event in ("exit", "reset"):
-        ok, result = close_position()
-        return jsonify({"status": "ok" if ok else "error", "result": str(result)}), 200 if ok else 500
+    elif event in ("exit", "tp", "sl", "reset"):
+        for account in ACCOUNTS:
+            result = close_position(account, symbol)
+            results[account["label"]] = result
 
     else:
         return jsonify({"error": f"Unknown event: {event}"}), 400
 
+    logger.info(f"Results: {results}")
+    return jsonify({"status": "ok", "event": event, "results": results})
+
+# ─────────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    status = "logged in" if session_token else "not logged in"
-    return jsonify({"status": "bridge running", "session": status}), 200
+    today_sizes = {
+        acc["label"]: calculate_lot_size(acc) for acc in ACCOUNTS
+    }
+    return jsonify({
+        "status":       "running",
+        "date":         str(date.today()),
+        "lot_sizes_today": today_sizes,
+    })
 
 if __name__ == "__main__":
-    login()
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
