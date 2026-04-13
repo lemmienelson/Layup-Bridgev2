@@ -128,7 +128,6 @@ def place_order(account, side, symbol, qty, tp_price, sl_price):
     }
     entry_result = send_order(account_code, token, entry_payload)
     logger.info(account_code + " entry: " + str(entry_result))
-
     results = {"entry": entry_result}
 
     # Only place TP/SL if entry succeeded
@@ -141,9 +140,10 @@ def place_order(account, side, symbol, qty, tp_price, sl_price):
             "side":           close_side,
             "quantity":       qty,
             "instrument":     symbol,
+            "positionCode":   symbol,
             "positionEffect": "CLOSE",
             "tif":            "GTC",
-            "price":          tp_price,
+            "limitPrice":     tp_price,
         }
         tp_result = send_order(account_code, token, tp_payload)
         logger.info(account_code + " TP: " + str(tp_result))
@@ -156,6 +156,7 @@ def place_order(account, side, symbol, qty, tp_price, sl_price):
             "side":           close_side,
             "quantity":       qty,
             "instrument":     symbol,
+            "positionCode":   symbol,
             "positionEffect": "CLOSE",
             "tif":            "GTC",
             "stopPrice":      sl_price,
@@ -195,6 +196,7 @@ def close_all(account, symbol):
         "side":           "SELL",
         "quantity":       qty,
         "instrument":     symbol,
+        "positionCode":   symbol,
         "positionEffect": "CLOSE",
         "tif":            "GTC",
     }
@@ -244,4 +246,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port
